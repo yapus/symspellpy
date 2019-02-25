@@ -101,7 +101,7 @@ class SymSpell(object):
         self._max_length = 0
         self._replaced_words = dict()
 
-    def create_dictionary_entry(self, key, count):
+    def create_dictionary_entry(self, key, count, staging=None):
         """Create/Update an entry in the dictionary. For every word
         there are deletes with an edit distance of 1..max_edit_distance
         created and added to the dictionary. Every delete entry has a
@@ -170,9 +170,18 @@ class SymSpell(object):
 
         # create deletes
         edits = self._edits_prefix(key)
-        for delete in edits:
-            delete_hash = self._get_str_hash(delete)
-            self._deletes[delete_hash].append(key)
+        # if not staging suggestions, put directly into main data
+        # structure
+        if staging is not None:
+            for delete in edits:
+                staging.add(self._get_str_hash(delete), key)
+        else:
+            for delete in edits:
+                delete_hash = self._get_str_hash(delete)
+                self._deletes[delete_hash].append(key)
+        # for delete in edits:
+        #     delete_hash = self._get_str_hash(delete)
+        #     self._deletes[delete_hash].append(key)
         return True
 
     def load_dictionary(self, corpus, term_index, count_index,
@@ -194,6 +203,7 @@ class SymSpell(object):
         """
         if not os.path.exists(corpus):
             return False
+        staging = SuggestionStage(16384)
         with open(corpus, "r", encoding=encoding) as infile:
             for line in infile:
                 line_parts = line.rstrip().split(" ")
@@ -201,7 +211,9 @@ class SymSpell(object):
                     key = line_parts[term_index]
                     count = helpers.try_parse_int64(line_parts[count_index])
                     if count is not None:
-                        self.create_dictionary_entry(key, count)
+                        # self.create_dictionary_entry(key, count)
+                        self.create_dictionary_entry(key, count, staging)
+        self.commit_staged(staging)
         return True
 
     def create_dictionary(self, corpus, encoding=None):
@@ -262,6 +274,17 @@ class SymSpell(object):
         self._max_length = pickle_data["max_length"]
         return True
 
+    def commit_staged(self, staging):
+        """Commit staged dictionary additions. Used when you write your
+        own process to load multiple words into the dictionary, and as
+        part of that process, you first created a SuggestionsStage
+        object, and passed that to create_dictionary_entry calls.
+
+        Keyword argument:
+        staging -- The SuggestionStage object storing the staged data.
+        """
+        staging.commit_to(self._deletes)
+    
     def lookup(self, phrase, verbosity, max_edit_distance=None,
                include_unknown=False, ignore_token=None):
         """Find suggested spellings for a given phrase word.
@@ -945,6 +968,124 @@ class SuggestItem(object):
     @count.setter
     def count(self, count):
         self._count = count
+
+class SuggestionStage(object):
+    def __init__(self, initial_capacity):
+        """Create a new instance of SuggestionStage.
+        Specifying ann accurate initial_capacity is not essential, but
+        it can help speed up processing by aleviating the need for
+        data restructuring as the size grows.
+
+        Keyword arguments:
+        initial_capacity -- The expected number of words that will be
+            added.
+        """
+        self._deletes = {}
+        self._nodes = _ChunkArray(initial_capacity * 2)
+
+    def add(self, delete_hash, suggestion):
+        entry = (_Entry(0, -1)
+                 if delete_hash not in self._deletes
+                 else self._deletes[delete_hash])
+
+        next_count = entry.first
+        entry.count += 1
+        entry.first = len(self._nodes)
+        self._deletes[delete_hash] = entry
+        self._nodes.add(_Node(suggestion, next_count))
+
+    def commit_to(self, permanent_deletes):
+        for key, value in self._deletes.items():
+            i = 0
+            suggestions = [None] * value.count
+            next_count = value.first
+            while next_count >= 0:
+                node = self._nodes[next_count]
+                suggestions[i] = node.suggestion
+                next_count = node.next
+                i += 1
+            if key in permanent_deletes:
+                permanent_deletes[key].extend(suggestions)
+            else:
+                permanent_deletes[key] = suggestions
+
+    def clear(self):
+        """Clears all the data from the SuggestionStage."""
+        self._deletes.clear()
+        self._nodes.clear()
+
+    @property
+    def delete_count(self):
+        """Gets the count of unique delete words."""
+        return len(self._deletes)
+
+    @property
+    def node_count(self):
+        """Gets the total count of all suggestions for all deletes."""
+        return len(self._nodes)
+
+class _Node(object):
+    __slots__ = ("suggestion", "next")
+    def __init__(self, suggestion=None, next=None):
+        self.suggestion = suggestion
+        self.next = next
+
+class _Entry(object):
+    __slots__ = ("count", "first")
+    def __init__(self, count=None, first=None):
+        self.count = count
+        self.first = first
+
+class _ChunkArray(object):
+    """A growable list of elements that's optimized to support adds,
+    but not deletes, of large numbers of elements, storing data in a
+    way that's friendly to the garbage collector (not backed by a
+    monolithic array object), and can grow without needing to copy the
+    entire backing array contents from the old backing array to the
+    new.
+    """
+    def __init__(self, initial_capacity):
+        # number of bits to shift right to do division by _chunk_size
+        # (the bit position of _chunk_size)
+        self._div_shift = 12
+        # self._div_shift = 2
+        # this must be a power of 2, otherwise can't optimize Row and
+        # Col functions
+        self._chunk_size = 2 ** self._div_shift
+        chunks = (initial_capacity + self._chunk_size - 1) // self._chunk_size
+        self.values = [[None] * self._chunk_size for __ in range(chunks)]
+        self.count = 0
+
+    def __getitem__(self, index):
+        return self.values[self.row(index)][self.col(index)]
+
+    def __setitem__(self, index, value):
+        self.values[self.row(index)][self.col(index)] = value
+
+    def __len__(self):
+        return self.count
+
+    def add(self, value):
+        if self.count == self.capacity:
+            self.values.append([None] * self._chunk_size)
+        self.values[self.row(self.count)][self.col(self.count)] = value
+        self.count += 1
+        return self.count - 1
+
+    def clear(self):
+        self.count = 0
+
+    def row(self, index):
+        # same as index / self._chunk_size
+        return index >> self._div_shift
+
+    def col(self, index):
+        # same as index % self._chunk_size
+        return index & (self._chunk_size - 1)
+
+    @property
+    def capacity(self):
+        return len(self.values) * self._chunk_size
 
 Composition = namedtuple("Composition", ["segmented_string", "corrected_string",
                                          "distance_sum", "log_prob_sum"])

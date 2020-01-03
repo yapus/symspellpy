@@ -157,8 +157,8 @@ def is_acronym(word, match_any_term_with_digits=False):
         ABCDE, AB12C. False if the word contains lower case letters,
         e.g., abcde, ABCde, abcDE, abCDe, abc12, ab12c
     """
-    if match_any_term_with_digits:
-        return any(i.isdigit() for i in word)
+    if match_any_term_with_digits and any(i.isdigit() for i in word):
+      return True
     return re.match(r"\b[A-Z0-9]{2,}\b", word) is not None
 
 def transfer_casing_for_matching_text(text_w_casing, text_wo_casing):

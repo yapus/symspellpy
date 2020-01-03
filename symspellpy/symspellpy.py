@@ -717,7 +717,12 @@ class SymSpell(object):
     def lookup_compound(self, phrase, max_edit_distance,
                         ignore_non_words=False, transfer_casing=False,
                         split_phrase_by_space=False,
-                        ignore_term_with_digits=False):
+                        ignore_term_with_digits=False,
+                        parse_words=helpers.parse_words,
+                        ignore_words=None,
+                        ignore_token=None,
+                        is_acronym=None):
+
         """`lookup_compound` supports compound aware automatic spelling
         correction of multi-word input strings with three cases:
 
@@ -749,7 +754,11 @@ class SymSpell(object):
         ignore_any_term_with_digits: bool, optional
             A flag to determine whether any term with digits
             is left alone during the spell checking process
-
+        parse_words: a function (text, *args) -> list, optional
+            A function compatible with helpers.parse_words(...)
+            which is called instead of helpers.parse_words
+        ignore_token: regexp, optional
+            Of ignored token, that's passed-through to calls to lookup(...)
         Returns
         -------
         suggestions_line : list
@@ -757,12 +766,12 @@ class SymSpell(object):
             representing suggested correct spellings for `phrase`.
         """
         # Parse input string into single terms
-        term_list_1 = helpers.parse_words(
+        term_list_1 = parse_words(
             phrase, split_by_space=split_phrase_by_space)
         # Second list of single terms with preserved cases so we can
         # ignore acronyms (all cap words)
         if ignore_non_words:
-            term_list_2 = helpers.parse_words(
+            term_list_2 = parse_words(
                 phrase, preserve_case=True,
                 split_by_space=split_phrase_by_space)
         suggestions = list()
@@ -777,18 +786,24 @@ class SymSpell(object):
                 if helpers.try_parse_int64(term_list_1[i]) is not None:
                     suggestion_parts.append(SuggestItem(term_list_1[i], 0, 0))
                     continue
-                if helpers.is_acronym(
+                if is_acronym is not None and is_acronym(term_list_2[i]) \
+                   or helpers.is_acronym(
                         term_list_2[i],
                         match_any_term_with_digits=ignore_term_with_digits):
                     suggestion_parts.append(SuggestItem(term_list_2[i], 0, 0))
                     continue
+                if ignore_words is not None and ignore_words(term_list_2[i], position=i):
+                    suggestion_parts.append(SuggestItem(term_list_2[i], 0, 0))
+                    continue
             suggestions = self.lookup(term_list_1[i], Verbosity.TOP,
-                                      max_edit_distance)
+                                      max_edit_distance,
+                                      ignore_token=ignore_token)
             # combi check, always before split
             if i > 0 and not is_last_combi:
                 suggestions_combi = self.lookup(
                     term_list_1[i - 1] + term_list_1[i], Verbosity.TOP,
-                    max_edit_distance)
+                    max_edit_distance,
+                    ignore_token=ignore_token)
                 if suggestions_combi:
                     best_1 = suggestion_parts[-1]
                     if suggestions:
@@ -830,10 +845,12 @@ class SymSpell(object):
                         part_1 = term_list_1[i][: j]
                         part_2 = term_list_1[i][j :]
                         suggestions_1 = self.lookup(part_1, Verbosity.TOP,
-                                                    max_edit_distance)
+                                                    max_edit_distance,
+                                                    ignore_token=ignore_token)
                         if suggestions_1:
                             suggestions_2 = self.lookup(part_2, Verbosity.TOP,
-                                                        max_edit_distance)
+                                                    max_edit_distance,
+                                                    ignore_token=ignore_token)
                             if suggestions_2:
                                 # select best suggestion for split pair
                                 tmp_term = (suggestions_1[0].term + " " +
